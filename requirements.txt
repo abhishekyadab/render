@@ -1,0 +1,7 @@
+flask
+gunicorn
+chromadb
+langchain
+google-genai
+tqdm
+python-dotenv
