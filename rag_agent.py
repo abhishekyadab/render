@@ -8,6 +8,7 @@ from google import genai
 from tqdm import tqdm
 from flask import Flask, request, jsonify
 import subprocess
+import time
 
 # 1. Load Gemini API key from .env or environment
 load_dotenv()
@@ -71,7 +72,7 @@ print("Splitting documents into chunks...")
 chunks = split_documents(documents)
 print(f"Created {len(chunks)} chunks")
 
-# 6. Embed chunks using Gemini
+# 6. Embed chunks using Gemini, with throttling and retry
 def embed(text):
     result = client.models.embed_content(
         model="models/embedding-001",
@@ -79,8 +80,29 @@ def embed(text):
     )
     return result.embeddings[0].values
 
+def embed_with_retry(text, retries=5, delay=2):
+    for attempt in range(retries):
+        try:
+            return embed(text)
+        except Exception as e:
+            if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                print(f"Rate limit hit, retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                print(f"Embedding error: {e}")
+                break
+    print("Failed to embed after retries.")
+    return None
+
 print("Creating embeddings...")
-embeddings = [embed(chunk["content"]) for chunk in tqdm(chunks)]
+embeddings = []
+for chunk in tqdm(chunks):
+    emb = embed_with_retry(chunk["content"])
+    if emb is not None:
+        embeddings.append(emb)
+    else:
+        embeddings.append([0.0]*768)  # Fallback vector
+    time.sleep(0.5)  # Throttle to avoid hitting rate limits
 
 # 7. Store embeddings in ChromaDB
 print("Storing embeddings in ChromaDB...")
@@ -110,7 +132,7 @@ def rag_query(query):
     enhanced_query = enhance_jwt_auth_query(query)
     
     # Embed the enhanced query
-    query_embedding = embed(enhanced_query)
+    query_embedding = embed_with_retry(enhanced_query)
     
     # Retrieve more relevant chunks (increased from 3 to 7)
     results = collection.query(
