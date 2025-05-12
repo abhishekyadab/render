@@ -9,6 +9,7 @@ from tqdm import tqdm
 from flask import Flask, request, jsonify
 import subprocess
 import time
+import threading
 
 # 1. Load Gemini API key from .env or environment
 load_dotenv()
@@ -47,10 +48,6 @@ def read_repository_files(repo_path):
                 print(f"Error reading {file_path}: {e}")
     return documents
 
-print("Reading repository files...")
-documents = read_repository_files(repo_path)
-print(f"Found {len(documents)} files")
-
 # 5. Split documents into chunks
 def split_documents(documents):
     chunks = []
@@ -67,10 +64,6 @@ def split_documents(documents):
                 "metadata": metadata
             })
     return chunks
-
-print("Splitting documents into chunks...")
-chunks = split_documents(documents)
-print(f"Created {len(chunks)} chunks")
 
 # 6. Embed chunks using Gemini, with throttling and retry
 def embed(text):
@@ -94,27 +87,39 @@ def embed_with_retry(text, retries=5, delay=2):
     print("Failed to embed after retries.")
     return None
 
-print("Creating embeddings...")
-embeddings = []
-for chunk in tqdm(chunks):
-    emb = embed_with_retry(chunk["content"])
-    if emb is not None:
-        embeddings.append(emb)
-    else:
-        embeddings.append([0.0]*768)  # Fallback vector
-    time.sleep(0.5)  # Throttle to avoid hitting rate limits
+# 7. Initialize ChromaDB and embeddings (run in background)
+def initialize_rag():
+    global collection
+    print("Reading repository files...")
+    documents = read_repository_files(repo_path)
+    print(f"Found {len(documents)} files")
 
-# 7. Store embeddings in ChromaDB
-print("Storing embeddings in ChromaDB...")
-chroma_client = chromadb.Client(Settings(anonymized_telemetry=False))
-collection = chroma_client.create_collection("godspeed_docs")
-for i, (chunk, embedding) in enumerate(tqdm(zip(chunks, embeddings))):
-    collection.add(
-        ids=[str(i)],
-        embeddings=[embedding],
-        documents=[chunk["content"]],
-        metadatas=[chunk["metadata"]]
-    )
+    print("Splitting documents into chunks...")
+    chunks = split_documents(documents)
+    print(f"Created {len(chunks)} chunks")
+
+    print("Creating embeddings...")
+    embeddings = []
+    for chunk in tqdm(chunks):
+        emb = embed_with_retry(chunk["content"])
+        if emb is not None:
+            embeddings.append(emb)
+        else:
+            embeddings.append([0.0]*768)  # Fallback vector
+        time.sleep(0.5)  # Throttle to avoid hitting rate limits
+
+    print("Storing embeddings in ChromaDB...")
+    chroma_client = chromadb.Client(Settings(anonymized_telemetry=False))
+    collection = chroma_client.create_collection("godspeed_docs")
+    for i, (chunk, embedding) in enumerate(tqdm(zip(chunks, embeddings))):
+        collection.add(
+            ids=[str(i)],
+            embeddings=[embedding],
+            documents=[chunk["content"]],
+            metadatas=[chunk["metadata"]]
+        )
+    print("RAG initialization complete.")
+    return collection
 
 # 8. Enhanced RAG query function
 def enhance_jwt_auth_query(query):
@@ -133,7 +138,8 @@ def rag_query(query):
     
     # Embed the enhanced query
     query_embedding = embed_with_retry(enhanced_query)
-    
+    if not collection:
+        return "RAG system is still initializing, please try again later."
     # Retrieve more relevant chunks (increased from 3 to 7)
     results = collection.query(
         query_embeddings=[query_embedding],
@@ -174,6 +180,10 @@ Question: {query}
 # 9. Flask API for deployment
 app = Flask(__name__)
 
+@app.route('/health')
+def health_check():
+    return jsonify({"status": "ok"}), 200
+
 @app.route('/query', methods=['POST'])
 def handle_query():
     data = request.json
@@ -181,7 +191,17 @@ def handle_query():
     answer = rag_query(user_query)
     return jsonify({"answer": answer})
 
+# 10. Start the Flask app and RAG initialization in background
+collection = None
+
+def background_rag_init():
+    global collection
+    collection = initialize_rag()
+
 if __name__ == "__main__":
     print("Godspeed Documentation RAG Agent Ready!")
+    # Start RAG initialization in a background thread
+    threading.Thread(target=background_rag_init, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
